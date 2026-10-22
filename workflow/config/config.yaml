@@ -1,0 +1,9 @@
+# --- inputs ---
+data_url: "https://mothur.s3.us-east-2.amazonaws.com/wiki/miseqsopdata.zip"
+silva_url: "https://zenodo.org/records/4587955/files/silva_nr99_v138.1_train_set.fa.gz"
+
+# --- DADA2 filtering parameters ---
+# chosen from the read quality profiles (see the R Markdown walkthrough),
+# not defaults: forward reads stay clean to 240, reverse reads decay after 160
+trunc_len: [240, 160]
+max_ee: [2, 2]
