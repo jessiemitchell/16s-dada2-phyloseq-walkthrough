@@ -1,0 +1,581 @@
+---
+title: "End-to-end 16S rRNA analysis: DADA2 denoising to phyloseq ecology"
+author: "Jessica Mitchell"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+---
+
+## What this is
+
+A fully reproducible walkthrough of a standard 16S rRNA amplicon analysis: raw paired-end fastq files, through quality control and DADA2 denoising to amplicon sequence variants (ASVs), taxonomic classification, and ecological analysis in phyloseq.
+
+**Background, briefly.** Most bacteria can't be grown in a lab, so to find out which organisms are in a sample we sequence a marker gene instead of whole genomes. The 16S rRNA gene is that marker: every bacterium carries it, and it alternates between stretches that are nearly identical across all bacteria — where universal PCR primers can bind — and variable regions that act as fingerprints for telling taxa apart. Here we sequence one variable region, V4 (~250 bp), from both ends ("paired-end", 2×250 bp reads). The older approach grouped similar sequences into operational taxonomic units (OTUs) at an arbitrary 97% similarity cutoff; this walkthrough instead recovers the exact biological sequences present — ASVs — which are reproducible labels that can be compared directly across samples and studies.
+
+**The pipeline at a glance.** (1) Inspect the raw read quality and choose filtering parameters from it. (2) Filter and trim the reads. (3) Learn the sequencing error rates from the data itself. (4) Denoise: correct the errors and infer the true ASVs. (5) Merge the paired reads, build the sample-by-ASV count table, and remove chimeras. (6) Assign a taxonomy to each ASV. (7) Validate everything against a mock community of known composition. (8) Analyze the community ecology — diversity, composition, differential abundance — in phyloseq.
+
+**Data:** the mothur MiSeq SOP example dataset — 2x250 bp Illumina MiSeq sequencing of the V4 region of the 16S rRNA gene, from fecal samples collected longitudinally from mice post-weaning, plus a mock community of known composition that we use to validate the pipeline. Public data, courtesy of the mothur project.
+
+**Tools:** R, [DADA2](https://benjjneb.github.io/dada2/) (denoising), [phyloseq](https://joey711.github.io/phyloseq/) (ecological analysis), SILVA v138 (taxonomy), metacoder (heat tree), DESeq2 + ALDEx2 + ANCOM-BC2 + MaAsLin 3 (consensus differential abundance), [chkMocks](https://github.com/microsud/chkMocks) (mock-community composition check).
+
+## Setup
+
+Packages are installed by `install-packages.R` in the repository root — run it once (`source("install-packages.R")`) before knitting. It installs everything this walkthrough uses, including the GitHub-only packages.
+
+```{r setup, message=FALSE}
+# Knit shows text, code, and plots only — no warnings or package messages
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+library(dada2)       # denoising: filter, error model, ASVs
+library(phyloseq)    # ecological analysis
+library(Biostrings)  # DNA sequence handling
+library(ggplot2)     # plots
+theme_set(theme_bw())
+set.seed(1)          # reproducible ordination
+```
+
+The setup chunk also fixes a plot theme and a random seed — the seed makes the NMDS ordination (which starts from a random arrangement) come out identical on every run.
+
+Download the example data (cached locally after the first run). A sequencing run delivers one pair of files per sample: the forward reads (`_R1_`) and the reverse reads (`_R2_`), each a fastq file — a text format that stores every read's sequence together with a per-base quality score. Because the amplicon (~250 bp) is shorter than the two reads combined (500 bp), the forward and reverse reads of each pair overlap and can later be merged back into one full-length sequence.
+
+```{r download-data}
+url <- "https://mothur.s3.us-east-2.amazonaws.com/wiki/miseqsopdata.zip"
+if (!dir.exists("MiSeq_SOP")) {
+  download.file(url, destfile = "MiSeq_SOP.zip")
+  unzip("MiSeq_SOP.zip")
+}
+path <- "MiSeq_SOP"
+list.files(path)
+```
+
+The listing shows the dataset's layout: a fastq pair for each mouse fecal sample (named for the mouse and the day it was collected), a `Mock` pair for the mock community, and the `HMP_MOCK.v35.fasta` reference file used for validation later.
+
+Read in the fastq filenames and extract sample names. The code lists the forward files (`fnFs`) and reverse files (`fnRs`) in sorted order — sorting matters, because it guarantees the forward and reverse lists line up pair by pair — and takes everything before the first underscore of each filename as the sample name:
+
+```{r read-names}
+fnFs <- sort(list.files(path, pattern = "_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern = "_R2_001.fastq", full.names = TRUE))
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+## Inspect read quality
+
+Always look before filtering — the quality profiles decide the truncation parameters, and those decisions are data-specific. Each plot shows the mean quality score by cycle (green line) with the quartiles in orange, over a heatmap of how many reads carry each score. What we're looking for:
+
+- **Where the tail gives out.** Quality always decays toward the end of a read. Where it slides toward Q20 is the ceiling for truncation length — bases beyond it carry more error than the denoiser can model.
+- **Whether the pair still overlaps.** The two truncation lengths must span the amplicon plus ~20 bp of overlap for merging. V4 is ~253 bp, so the lengths need to sum comfortably past ~275.
+- **How much worse the reverse reads are.** They almost always degrade sooner, so expect to truncate them harder.
+- **Whether the run is salvageable at all.** Decay in the tail is normal and fixable. Quality poor from the first cycles is a failed run, not a parameter problem.
+
+```{r quality, fig.width=7, fig.height=5}
+plotQualityProfile(fnFs[1:2])
+plotQualityProfile(fnRs[1:2])
+```
+
+Reading these two plots: the forward reads hold a mean quality around Q30 or better out to ~240 bp before the tail sags; the reverse reads decay sooner, sliding through the high Q20s around 150–170 bp, as usual for Illumina. So we truncate forward reads at 240 and reverse reads at 160 — cutting each where its quality gives out, while their sum (400 bp) still far exceeds the ~253 bp amplicon, leaving a generous overlap for merging.
+
+## Filter and trim
+
+Filtering is where raw reads become trustworthy reads. `filterAndTrim()` processes the forward and reverse files pair by pair and discards — or first truncates — any read that fails one of the checks. The parameters, one by one:
+
+- `truncLen = c(240, 160)` — cut the forward reads to 240 bp and the reverse reads to 160 bp, the lengths chosen from the quality profiles above. Everything past the cut is thrown away, and any read that ends up shorter than the cut (because it was trimmed earlier, below) is discarded.
+- `truncQ = 2` — truncate a read at the first base whose quality score is 2 or lower. A base that bad usually means the rest of the read is unreliable too.
+- `maxN = 0` — discard any read containing an `N`, an uncalled base. DADA2's error model cannot work with ambiguous bases.
+- `maxEE = c(2, 2)` — discard reads with more than 2 *expected errors*. Each base's quality score converts to an error probability; a read's expected errors are the sum over all its bases. A long run of mediocre bases can therefore be as untrustworthy as a few terrible ones, and this filter catches that.
+- `rm.phix = TRUE` — remove reads from the PhiX virus, a control that Illumina spikes into sequencing runs. PhiX reads are not part of the sample.
+- `compress = TRUE` — write the filtered files compressed, to save disk space.
+
+```{r filter-trim}
+# DADA2 refuses to overwrite existing filtered files, so clear any from a previous run first
+unlink(file.path(path, "filtered"), recursive = TRUE)
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs,
+                     truncLen = c(240, 160),
+                     maxN = 0, maxEE = c(2, 2), truncQ = 2,
+                     rm.phix = TRUE, compress = TRUE, multithread = TRUE)
+head(out)
+```
+
+The `out` table reports, for every sample, how many reads went in and how many survived filtering. Losing roughly 10–25% of reads here is normal — that is the price of the quality bar. A sample that loses most of its reads at this step had worse quality than the rest, which is worth remembering when its results are interpreted later.
+
+## Learn error rates
+
+Error rates depend on the quality score and the specific base change — misreading an A as a C is not as likely as A as a T. DADA2 learns the full table from the data itself, iterating between guessing which sequences are real and re-estimating the rates. Denoising then becomes arithmetic: how probable is it that this many mismatches appeared by error alone? (The method is Callahan et al., 2016.)
+
+```{r learn-errors, fig.width=7, fig.height=5}
+errF <- learnErrors(filtFs, multithread = TRUE)
+errR <- learnErrors(filtRs, multithread = TRUE)
+plotErrors(errF, nominalQ = TRUE)
+```
+
+**How to read `plotErrors`, simply.** Each panel is one kind of misread (A→C, A→G, and so on). The x-axis is the consensus quality score: a Phred score, roughly 0–40, where higher means more trustworthy — Q10 = 10% chance the base is wrong, Q20 = 1%, Q30 = 0.1%, Q40 = 0.01%. ("Consensus" because identical reads are collapsed into one unique sequence, whose quality at each position is averaged over the reads it came from.) Points are the error rates actually observed at each score; the black line is the model's fit; the red line is what the scores alone would predict. **What we are looking for:** the black line runs through the points and slopes down — higher quality really does mean fewer errors. If the black line sat above the points, the model would be overestimating errors, and denoising would erase real, rare sequences.
+
+## Denoise
+
+`dada()` turns filtered reads into ASVs. Starting from the most abundant unique read, it asks of each next read: could this be an error copy of a cluster that already exists, judged by the error model? If yes, it joins that cluster; if too different, it founds a new one — a newly inferred true sequence. Each cluster center is an ASV, its size the corrected abundance. Samples are processed independently, and nothing is merged at an arbitrary similarity threshold: a one-base difference is kept if the error model says it cannot be noise.
+
+```{r denoise}
+dadaFs <- dada(filtFs, err = errF, multithread = TRUE)
+dadaRs <- dada(filtRs, err = errR, multithread = TRUE)
+dadaFs[[1]]
+```
+
+Printing the first sample's result summarizes the inference: how many filtered reads went in, and how many clusters (ASVs) they resolved into. The ASV count is far smaller than the number of distinct raw reads — most of the uniqueness in raw sequencing data is error, not biology.
+
+## Merge paired reads
+
+`mergePairs()` stitches each forward/reverse pair back into a single full-length amplicon sequence. It takes the reverse read, reverse-complements it (the two reads were sequenced from opposite strands), and aligns it against its forward partner across the region where they overlap. A pair merges only if the overlap aligns well — by default at least 12 bp of overlap with no mismatches, though because both reads have already been denoised, any residual disagreement can be resolved rather than rejected. Pairs that fail to merge are discarded; the usual cause is quality trimming so aggressive that the two reads no longer reach each other, which is why the truncation lengths had to respect the overlap constraint back in the quality step.
+
+```{r merge}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+head(mergers[[1]])
+```
+
+Each row of the output is one merged sequence from the first sample: its abundance, the forward and reverse reads it was built from, and the overlap diagnostics. In a healthy dataset essentially every row shows a perfect overlap match (`nmismatch = 0`, `accept = TRUE`).
+
+## Build the ASV table and remove chimeras
+
+`makeSequenceTable()` gathers the merged sequences from every sample into the central data structure of the whole analysis: a count table with samples as rows and ASVs as columns, where each cell is the number of reads observed for that sequence in that sample. `dim()` reports its size — number of samples × number of distinct ASVs. The length check underneath is a quick sanity test: genuine V4 ASVs should cluster tightly around the expected amplicon length (~253 bp). A spray of much shorter or longer sequences would mean artifacts survived denoising.
+
+```{r asv-table}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+table(nchar(getSequences(seqtab)))  # amplicon lengths fall in the expected V4 range
+```
+
+One artifact class remains: chimeras — PCR products whose left half comes from one organism and right half from another, formed when a partial product re-primes on a different template. A chimera looks like a novel organism, so it inflates diversity. `removeBimeraDenovo()` flags any sequence that can be rebuilt exactly by splicing two more-abundant sequences (a "bimera": two parents); the `consensus` method judges within each sample, then combines evidence across samples.
+
+```{r chimeras}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method = "consensus",
+                                    multithread = TRUE, verbose = TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim) / sum(seqtab)  # fraction of reads retained
+```
+
+Expect the retained fraction to be high: chimeras are numerous as sequences but rare as reads, since each is created once or twice while its parents are copied thousands of times.
+
+## Track reads through the pipeline
+
+The single most useful QC table in any amplicon project — no step should lose a majority of reads:
+
+```{r track-reads}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out,
+               sapply(dadaFs, getN),
+               sapply(dadaRs, getN),
+               sapply(mergers, getN),
+               rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR",
+                     "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+
+How to read it: follow one sample across the columns. A drop at filtering is normal; denoising and merging should each cost little. Trouble looks like a cliff at merging (reads no longer overlap — truncation too aggressive) or one sample bleeding reads at every step (a problem sample, not a problem pipeline).
+
+## Assign taxonomy
+
+So far every ASV is just a string of bases. Taxonomy assignment asks which lineage each comes from, against a reference database — here SILVA v138. DADA2's classifier (the RDP naive Bayesian classifier) compares word frequencies: it breaks a sequence into overlapping 8-mers and finds the reference genus whose sequences use those words most similarly; higher ranks follow. Confidence comes from bootstrapping — an assignment is reported at a rank only if it wins at least half the resamples. Two things to remember: genus is usually the deepest level a ~250 bp fragment can support (species calls from short reads are rarely trustworthy), and an `NA` at genus with a solid family above it is information, not failure — often a real organism the database doesn't cover at genus level.
+
+```{r taxonomy}
+silva_url <- "https://zenodo.org/records/4587955/files/silva_nr99_v138.1_train_set.fa.gz"
+silva_file <- "silva_nr99_v138.1_train_set.fa.gz"
+# The file is ~131 MB and R's default download timeout is 60 seconds, so raise it.
+# Download to a temp file first: a failed download then leaves no partial file
+# behind for the next run to mistake for the real thing.
+if (!file.exists(silva_file) || file.size(silva_file) < 1.3e8) {
+  options(timeout = 1200)
+  tmp <- tempfile(fileext = ".fa.gz")
+  download.file(silva_url, destfile = tmp, method = "libcurl", mode = "wb")
+  file.rename(tmp, silva_file)
+}
+
+taxa <- assignTaxonomy(seqtab.nochim, silva_file, multithread = TRUE)
+taxa.print <- taxa
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+The table has one row per ASV and one column per taxonomic rank. A quick scan is a useful sanity check: essentially everything should be Bacteria, and most ASVs should carry assignments at least to family.
+
+## Validate against the mock community
+
+A mock community is the closest thing amplicon sequencing has to ground truth: a sample assembled from known organisms and carried through the same extraction, PCR, and sequencing as the real samples. Whatever the pipeline reports about the mock can be checked against what was actually put in. The check here is the strictest available: each ASV recovered from the mock sample is compared against the strains' reference 16S sequences, and it must match *exactly*, base for base — not approximately, not at 97% similarity. If denoising had left residual error in the sequences, it would show up here as near-miss ASVs differing from a reference by a base or two.
+
+```{r mock}
+unqs.mock <- seqtab.nochim["Mock", ]
+unqs.mock <- sort(unqs.mock[unqs.mock > 0], decreasing = TRUE)
+cat("DADA2 inferred", length(unqs.mock), "ASVs in the mock community.\n")
+
+mock.ref <- getSequences(file.path(path, "HMP_MOCK.v35.fasta"))
+match.ref <- sum(sapply(names(unqs.mock), function(x) any(grepl(x, mock.ref))))
+cat("Of those,", sum(match.ref), "exactly match the expected reference sequences.\n")
+```
+
+20 strains in, 20 exact sequence matches out — no near-misses, no extras at meaningful abundance. At the level of *which sequences exist*, the pipeline is exact.
+
+### How accurate are the abundances? (chkMocks)
+
+Exact recovery confirms the sequences; it says nothing about whether their *proportions* are right — extraction and PCR bias can quietly distort those. Checking proportions needs an expected composition to compare against. Where that expectation comes from is the whole problem of this section.
+
+**What was — and wasn't — run here.** The only mock sequenced in this walkthrough is the HMP mock in the example data. **No ZymoBIOMICS standard was run.** Zymo appears here for readers who do run one: it is the most widely used commercial standard — ten species (eight bacteria, two yeasts), sold as whole cells, with a published theoretical composition (D6300 roughly even; D6310 spread over a log range). Because it starts from intact cells, it exercises the whole workflow, lysis included — and because the composition is published, the `chkMocks` function `checkZymoBiomics()` (Shetty et al., *Microbiome Res Rep* 2023) scores a run against it directly. If you have a Zymo run, that is the one-step route, and none of the modelling below is needed.
+
+**This section's route: a custom mock.** `chkMocks` also provides `compare2theorectical()`, which runs the same comparison against an expectation you supply yourself. That is what the rest of this section does — because, as the next paragraph explains, the HMP mock has no published composition, so the expectation has to be built by hand, with all the uncertainty that implies.
+
+The mothur SOP itself uses the mock only for error rates, and for good reason: the vendor's per-strain proportions for this lot were never published, so an "expected composition" has to be a model. The pool is the HMP mock community sold by BEI Resources as HM-276D — genomic DNA from 21 bacterial strains. The reference file shipped with the data (`HMP_MOCK.v35.fasta`, 32 sequences) tells the real story: the 20 strains DADA2 recovered above appear there as 31 reference sequences, because several strains contribute multiple distinct 16S operons (four for *Bacteroides vulgatus*, three each for *Clostridium beijerinckii* and *Staphylococcus epidermidis*, two for *Pseudomonas aeruginosa* and *Enterococcus faecalis*). The 21st strain, *Helicobacter pylori*, contributes one reference sequence but no ASV: its genomic DNA was in the pool, yet no reads appear — consistent with reports that it was present at far lower abundance than the other strains, so an equal-share expectation for it would be fiction. For the remaining 20, we build two expectations. **Both describe the same pool** — genomic DNA mixed, presumably, at roughly equal mass per strain. They differ only in how DNA mass is converted into 16S template numbers, which is what sequencing actually counts:
+
+- **EqualDNA** — each strain at 5% of reads: equal DNA mass in, equal share of 16S templates out. This is the implicit assumption behind nearly all informal mock checks, and it ignores operon number and genome size entirely.
+- **Template-weighted** — the same equal-mass pool, with one correction: strain *i* at *cᵢ·gᵢ* / Σ*c·g*, where *cᵢ* is the strain's 16S rRNA operon copy number and 1/*gᵢ* weights its genome size. A strain with many operons and a small genome packs more 16S templates into a nanogram than one with few operons and a large genome. Copy numbers and genome sizes are representative published values (rrnDB / type-strain genomes) — an informed estimate, not ground truth.
+
+Neither expectation is the truth; the truth was never published. Read them as brackets: if the pipeline were unbiased, the observed composition would sit somewhere in the range the two assumptions span.
+
+```{r chkmocks, message=FALSE}
+if (!requireNamespace("chkMocks", quietly = TRUE))
+  stop("Install chkMocks first: remotes::install_github('microsud/chkMocks')")
+library(chkMocks)
+
+# Custom-mock identity comes from exact matching against the reference
+# sequences themselves (simpler than chkMocks' IdTaxa route, which needs a
+# trained DECIPHER classifier). The reference headers are abbreviated species
+# codes (e.g. "B.vulgatus.2" = Bacteroides vulgatus, operon variant 2), and
+# several strains have more than one: match each ASV to a strain prefix and
+# aggregate its operon variants.
+strain.of <- sapply(names(unqs.mock), function(x) {
+  hit <- which(sapply(mock.ref, function(r) grepl(x, r)))
+  if (length(hit) >= 1) sub("\\.[0-9]+$", "", names(mock.ref)[hit[1]]) else "Other"
+})
+obs <- tapply(unqs.mock, strain.of, sum)
+obs <- obs[order(-obs)]
+
+# Reference-prefix codes for the 20 recovered strains (H. pylori excluded, see
+# text), with representative per-strain values: GenomeMb = genome size (Mb),
+# rrn = 16S rRNA operons per genome, RefSeqs = distinct operon sequences in the
+# reference file.
+hmp.strains <- data.frame(
+  Code = c("A.baumannii", "A.odontolyticus", "B.cereus", "B.vulgatus",
+           "C.beijerinckii", "D.radiodurans", "E.faecalis", "E.coli",
+           "L.gasseri", "L.monocytogenes", "N.meningitidis", "P.gingivalis",
+           "P.acnes", "P.aeruginosa", "R.sphaeroides", "S.aureus",
+           "S.epidermidis", "S.agalactiae", "S.mutans", "S.pneumoniae"),
+  Strain = c("Acinetobacter baumannii", "Actinomyces odontolyticus",
+             "Bacillus cereus", "Bacteroides vulgatus",
+             "Clostridium beijerinckii", "Deinococcus radiodurans",
+             "Enterococcus faecalis", "Escherichia coli",
+             "Lactobacillus gasseri", "Listeria monocytogenes",
+             "Neisseria meningitidis", "Porphyromonas gingivalis",
+             "Propionibacterium acnes", "Pseudomonas aeruginosa",
+             "Rhodobacter sphaeroides", "Staphylococcus aureus",
+             "Staphylococcus epidermidis", "Streptococcus agalactiae",
+             "Streptococcus mutans", "Streptococcus pneumoniae"),
+  GenomeMb = c(3.98, 2.80, 5.43, 5.16, 6.00, 3.28, 3.22, 4.90, 1.89, 2.94,
+               2.20, 2.35, 2.56, 6.26, 4.60, 2.80, 2.60, 2.13, 2.03, 2.10),
+  rrn      = c(6, 2, 13, 7, 14, 8, 4, 7, 6, 6,
+               4, 4, 3, 4, 3, 6, 5, 7, 5, 4),
+  RefSeqs  = c(1, 1, 1, 4, 3, 1, 2, 1, 1, 1,
+               1, 1, 1, 2, 1, 2, 3, 1, 1, 1))
+rownames(hmp.strains) <- hmp.strains$Code
+hmp.strains$EvenDNA  <- 100 / nrow(hmp.strains)
+hmp.strains$Template <- with(hmp.strains,
+                             100 * (rrn / GenomeMb) / sum(rrn / GenomeMb))
+
+# Observed percent per strain (keyed by reference-prefix code), aligned to the
+# same strain set; "Other" ASVs are discussed in the text, not the table.
+obs.pct <- 100 * obs / sum(obs)
+hmp.strains$Observed <- 0
+shared <- intersect(names(obs.pct), rownames(hmp.strains))
+hmp.strains[shared, "Observed"] <- obs.pct[shared]
+knitr::kable(hmp.strains[, c("Strain", "GenomeMb", "rrn", "RefSeqs",
+                             "EvenDNA", "Template", "Observed")],
+             digits = 2, caption = "HMP mock: expected vs. observed composition (%)")
+
+# chkMocks expects one phyloseq object whose OTU table holds the experimental
+# and theoretical samples side by side (taxa as rows).
+comp <- hmp.strains[, c("EvenDNA", "Template", "Observed")]
+colnames(comp) <- c("EvenDNA", "TemplateWeighted", "Mock")
+ps.chk <- phyloseq(otu_table(as.matrix(comp), taxa_are_rows = TRUE))
+compare2theorectical(ps.chk, theoretical_id = "TemplateWeighted")
+compare2theorectical(ps.chk, theoretical_id = "EvenDNA")
+```
+
+```{r chkmocks-plot, fig.width=7, fig.height=5}
+chk.df <- data.frame(Strain = factor(hmp.strains$Strain,
+                                     levels = hmp.strains$Strain[order(-hmp.strains$Observed)]),
+                     Expected = hmp.strains$Template,
+                     Observed = hmp.strains$Observed)
+ggplot(chk.df, aes(x = Strain)) +
+  geom_col(aes(y = Observed), fill = "steelblue") +
+  geom_point(aes(y = Expected), color = "firebrick", size = 2) +
+  coord_flip() +
+  labs(y = "Mock composition (%)", x = NULL,
+       title = "Observed (bars) vs. template-weighted model expectation (dots)")
+```
+
+How to read the output. `compare2theorectical()` reports a Spearman correlation between expected and observed compositions: do the strains *rank* in the same order under both? (1 = identical ranking, 0 = no relationship.) Ranking is the fair question, because the expectations are models, not truths. The plot makes the same comparison visually — each bar a strain's observed share, the red dot its template-weighted model expectation — and on this mock, expect many dots to sit well away from their bars. That is not, by itself, a failed check: the dots were derived from copy numbers and genome sizes, not measured, and extraction and PCR bias move the bars as well. A strain whose dot is far off under *both* expectations, or one that is missing entirely, is the real warning sign.
+
+Read the two correlations as a bracket, not a verdict. Real strains should rank similarly under either expectation; a strain far off both is a genuine bias signal (the usual suspects are primer mismatch and extraction-resistant cell walls), while scatter *between* the two correlations mostly measures model uncertainty — 16S copy-number and genome-size corrections are approximations, and residual amplification bias exists even in a perfect pipeline. What this rules out is the failure mode that matters: no expected strain is missing, and nothing unexpected is present at meaningful abundance. Contrast a ZymoBIOMICS run (not done here): there the expectation is a measured, published composition, the dots *should* land on their bars, and a dot that misses is a direct measurement of pipeline bias. The HMP mock offers no such ground truth — treat this section as a plausibility check, not a calibration.
+
+## Handoff to phyloseq
+
+phyloseq (McMurdie & Holmes, 2013) analyzes a count table together with everything known about the samples: its object bundles the ASV table, taxonomy, sample metadata, and the sequences themselves, so subsetting any one piece subsets the others — counts and metadata can't fall out of alignment. This dataset's metadata is minimal and mined from the sample names, which encode the mouse, its sex, and the day post-weaning; `When` splits the time course at day 100 into early and late. Two cleanup steps follow: the mock sample is removed (a control, not a mouse), and ASVs are renamed ASV1, ASV2, … for readable plots — the full sequences stay in the object's `refseq` slot.
+
+```{r phyloseq-import, message=FALSE}
+samples.out <- rownames(seqtab.nochim)
+subject <- sapply(strsplit(samples.out, "D"), `[`, 1)
+gender <- substr(subject, 1, 1)
+subject <- substr(subject, 2, 999)
+day <- as.integer(sapply(strsplit(samples.out, "D"), `[`, 2))
+samdf <- data.frame(Subject = subject, Gender = gender, Day = day)
+samdf$When <- "Early"
+samdf$When[samdf$Day > 100] <- "Late"
+rownames(samdf) <- samples.out
+
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows = FALSE),
+               sample_data(samdf),
+               tax_table(taxa))
+ps <- prune_samples(sample_names(ps) != "Mock", ps)  # drop the mock control
+
+# Short ASV names for plots; keep full sequences in the refseq slot
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+ps
+```
+
+Printing the object summarizes it: how many samples and ASVs it holds, and which components are present. Every analysis below starts from this one object.
+
+### Alpha diversity
+
+Alpha diversity is diversity *within* a sample: how many kinds of organisms, and how evenly spread. Of the indices plotted, **Shannon** weights types by abundance and stays sensitive to rare taxa; **Simpson** is dominated by the abundant taxa. When they tell the same story, the pattern is robust; when they disagree, the difference lives in the rare tail.
+
+```{r alpha, fig.width=7, fig.height=4}
+plot_richness(ps, x = "Day", measures = c("Shannon", "Simpson"), color = "When")
+```
+
+Each point is one sample, plotted against the day it was collected and colored by early/late. The question to ask of the plot is whether diversity drifts as the mice mature after weaning, and whether the early and late samples occupy visibly different ranges.
+
+### Beta diversity: ordination
+
+Beta diversity compares samples *to each other*. Counts become proportions (so depth differences don't dominate), Bray–Curtis dissimilarity is computed for every pair (0 = identical composition, 1 = nothing shared), and NMDS arranges samples on a 2D map so point distances match the dissimilarities. Reading cautions: the axes have no units and the map can be rotated freely — only relative distances mean anything — and NMDS starts from a random arrangement, which is why the seed was fixed.
+
+```{r ordination, fig.width=6, fig.height=5}
+ps.prop <- transform_sample_counts(ps, function(otu) otu / sum(otu))
+ord.nmds.bray <- ordinate(ps.prop, method = "NMDS", distance = "bray")
+plot_ordination(ps.prop, ord.nmds.bray, color = "When", title = "Bray-Curtis NMDS")
+```
+
+Read the map by clustering: points near each other are compositionally similar samples. Here the early and late samples occupy different regions of the map — separation between early and late samples — so the community's composition shifts systematically over time post-weaning.
+
+### Composition
+
+Composition plots answer the plainest question: what is each sample made of? Counts become proportions, only the 20 most abundant ASVs are kept (the rare tail would smear the plot), and each bar is one sample, segmented by family and faceted into early and late panels.
+
+```{r composition, fig.width=8, fig.height=5}
+top20 <- names(sort(taxa_sums(ps), decreasing = TRUE))[1:20]
+ps.top20 <- prune_taxa(top20, transform_sample_counts(ps, function(otu) otu / sum(otu)))
+plot_bar(ps.top20, x = "Day", fill = "Family") + facet_wrap(~When, scales = "free_x")
+```
+
+Use this plot to find the "who" behind the diversity patterns: which families dominate overall, and which visibly expand or shrink between the early and late panels. Those shifts are exactly what the statistical test in the next section evaluates.
+
+### Heat tree
+
+One more view of the same community: a *heat tree* (metacoder; Foster et al., 2017) draws the whole taxonomy as a tree. Each node is a taxon, from phylum at the centre out to genus at the tips. Node size is the number of ASVs in the taxon; node colour is its mean relative abundance across samples. Big, dark branches are the community's backbone — many ASVs, high abundance. The tree is cut at genus level; deeper would be unreadable.
+
+```{r heat-tree, message=FALSE, warning=TRUE, fig.width=8, fig.height=8}
+library(metacoder)
+obj <- parse_phyloseq(ps)
+obj$data$taxon_abund <- calc_taxon_abund(obj, data = "otu_table")
+obj$data$taxon_abund$mean_abund <-
+  rowMeans(obj$data$taxon_abund[, -1, drop = FALSE])
+# Rank names come from the SILVA table ("Genus", capitalised) — match
+# case-insensitively, and fail loudly if the filter ever empties the tree
+# (an empty tree makes heat_tree quietly return NULL).
+obj <- filter_taxa(obj, tolower(taxon_ranks) == "genus", supertaxa = TRUE)
+if (length(obj$taxon_ids()) == 0)
+  stop("Heat tree: no taxa left after filtering to genus level.")
+p_tree <- heat_tree(obj,
+                    node_label = taxon_names,
+                    node_size = n_obs,
+                    node_color = mean_abund,
+                    node_size_axis_label = "ASV count",
+                    node_color_axis_label = "Mean abundance",
+                    layout = "davidson-harel",
+                    initial_layout = "reingold-tilford")
+# heat_tree returns a ggplot without drawing it, and knitr's plot capture
+# misses it — save to a file and include the file instead.
+ggplot2::ggsave("heat_tree.png", p_tree, width = 8, height = 8)
+knitr::include_graphics("heat_tree.png")
+```
+
+### Differential abundance
+
+The plots suggest differences; this step tests them — and differential abundance (DA) is where 16S analysis most often overpromises, so it gets more care than the other steps.
+
+**Why DA is treacherous.** A sequencer does not count the bacteria in a sample; it deals out a fixed number of reads in proportion to what is there. The data are *compositional*: the shares sum to one, so every taxon's apparent abundance depends on every other taxon. If one abundant taxon blooms in absolute terms, all the other shares shrink even though nothing about those taxa changed — and a method that reads shares at face value will call them decreased. Add the other facts of 16S life — most taxa absent from most samples, uneven sequencing depth between samples, counts more variable than any simple distribution allows — and there is no single obviously correct statistical model. Each published method copes differently: model the raw counts and normalize depth away inside the model (DESeq2); compare taxa as ratios, which cancels the compositionality (ALDEx2, ANCOM); estimate the sampling bias itself and remove it (ANCOM-BC); or fit linear models to transformed abundances (MaAsLin). Different assumptions, different answers.
+
+**How different?** Nearing et al. (2022) ran 14 DA methods across 38 real 16S datasets and found that the methods "identified drastically different numbers and sets of significant ASVs" — which taxa a study reports can hinge on the tool chosen, not just the biology. ALDEx2 and ANCOM-II were the most consistent across datasets and agreed best with the intersect of all methods' results. Their recommendation, adopted here: *"researchers should use a consensus approach based on multiple differential abundance methods to help ensure robust biological interpretations."*
+
+**One distinction the older tools blur.** A taxon can differ between groups in *prevalence* (how often it is present at all), in *abundance* (how much there is when it is present), or in both — different biology, usually tested as one blended quantity. MaAsLin 3 (Nickols et al., 2026) models the two separately — a logistic model for presence/absence plus a linear model for abundance-when-present, combined into a joint q-value — and in the inflammatory bowel disease cohort it was validated on, 77% of the associations it recovered were prevalence-driven. A satisfying footnote: Jacob Nearing, first author of the consensus paper, is a co-author of MaAsLin 3.
+
+So this step runs four methods whose assumptions genuinely differ, and trusts only what survives the vote:
+
+- **DESeq2** — a negative binomial model on the raw counts, with size factors absorbing the depth differences (the approach borrowed from RNA-seq, and the only method the first version of this walkthrough used).
+- **ALDEx2** — compositional: it Monte-Carlo-samples plausible count tables from a Dirichlet model, CLR-transforms each one, and tests on the ratios. The benchmark's most conservative method.
+- **ANCOM-BC2** — estimates each sample's sampling fraction (the compositionality bias) and corrects for it before testing, then stress-tests its own calls against different pseudocount choices.
+- **MaAsLin 3** — the prevalence/abundance hurdle model described above, with a median-coefficient comparison to counter compositional effects.
+
+**Filtering first.** Following the benchmark's design, ASVs found in at most 10% of samples are dropped before testing. A taxon present in three samples carries almost no information about a group difference, and every ASV tested costs statistical power through multiple-testing correction; filtering on overall prevalence — a criterion that never looks at the group labels, so it cannot bias the tests — spends that power on taxa that can actually be resolved.
+
+```{r da-filter}
+ps.da <- phyloseq::filter_taxa(ps, function(x) sum(x > 0) > 0.10 * length(x), prune = TRUE)
+ps.da
+```
+
+The filtered object is what all four methods see, so their votes are comparable. **DESeq2** runs first. It models each ASV's counts with a negative binomial — variance grows with the mean — on the *unrarefied* counts: rarefying (subsampling samples to equal depth) discards data, and its size factors handle depth inside the model instead (McMurdie & Holmes, 2014). It reports a **log2 fold change** per ASV (+1 = twice as abundant in late samples, −1 = half) and an adjusted p-value (`padj`); below 0.05 is the call.
+
+```{r da-deseq2, message=FALSE}
+library(DESeq2)
+dds <- phyloseq_to_deseq2(ps.da, ~ When)
+dds <- DESeq(dds, test = "Wald", fitType = "parametric")
+deseq.res <- as(results(dds, cooksCutoff = FALSE), "data.frame")
+sig.deseq <- rownames(deseq.res)[which(deseq.res$padj < 0.05)]
+length(sig.deseq)
+```
+
+**ALDEx2.** Rather than treating the observed proportions as exact, it Monte-Carlo-samples plausible compositions consistent with the counts, log-ratio-transforms each, and asks how consistently a taxon differs across all of them. The call is the expected adjusted Wilcoxon p-value, `we.eBH` < 0.05. Expect the shortest list of the four — that conservatism is the point.
+
+```{r da-aldex2, message=FALSE}
+library(ALDEx2)
+set.seed(1)
+aldex.res <- aldex(t(as(otu_table(ps.da), "matrix")),
+                   as.character(sample_data(ps.da)$When),
+                   test = "t", effect = TRUE, denom = "all")
+sig.aldex <- rownames(aldex.res)[aldex.res$we.eBH < 0.05]
+length(sig.aldex)
+```
+
+**ANCOM-BC2.** Where DESeq2 normalizes and ALDEx2 takes ratios, ANCOM-BC2 tries to undo the compositionality directly: it estimates how strongly each sample was over- or under-sampled and corrects the log abundances before fitting its model. Its built-in robustness call (`diff_robust`) requires a taxon to be significant — q < 0.05, using Benjamini–Hochberg here rather than the package's Holm default, for comparability with the other methods — *and* to stay significant across the pseudocount sensitivity analysis. That is the call counted below.
+
+```{r da-ancombc, message=FALSE}
+library(ANCOMBC)
+out.bc <- ancombc2(data = ps.da, fix_formula = "When", group = "When",
+                   p_adj_method = "BH", alpha = 0.05)
+res.bc <- out.bc$res
+q.col <- grep("^q_", colnames(res.bc), value = TRUE)
+q.col <- q.col[!grepl("Intercept", q.col)][1]  # the tested coefficient, e.g. q_WhenLate
+suffix <- sub("^q_", "", q.col)
+robust.col <- paste0("diff_robust_", suffix)
+if (!robust.col %in% colnames(res.bc)) robust.col <- paste0("diff_", suffix)
+sig.bc <- res.bc$taxon[res.bc[[robust.col]] %in% TRUE]
+length(sig.bc)
+```
+
+**MaAsLin 3.** Two models per taxon — logistic for presence/absence, linear for log abundance among the samples where the taxon is present — merged into one joint q-value per taxon; the authors' significance convention is a joint q below 0.1 (it already fuses two tests, so this is not the looseness it appears). One caution: with only ~35 samples the prevalence arm has little power, so on this dataset MaAsLin 3 votes mainly through its abundance model. Its full result tables (both models, every taxon) are written to the `maaslin3_output` folder.
+
+```{r da-maaslin3, message=FALSE, warning=FALSE}
+library(maaslin3)
+meta.m3 <- as(sample_data(ps.da), "data.frame")
+meta.m3$When <- factor(meta.m3$When, levels = c("Early", "Late"))
+fit.m3 <- maaslin3(input_data = as(otu_table(ps.da), "matrix"),
+                   input_metadata = meta.m3,
+                   output = "maaslin3_output",
+                   formula = ~ When,
+                   plot_summary_plot = FALSE, plot_associations = FALSE)
+m3.res <- rbind(fit.m3$fit_data_abundance$results,
+                fit.m3$fit_data_prevalence$results)
+m3.res <- m3.res[m3.res$metadata == "When", ]
+sig.m3 <- unique(m3.res$feature[m3.res$qval_joint < 0.1])
+length(sig.m3)
+```
+
+**The vote.** The four lists combine into one table — one row per ASV, one column per method, plus the vote count. The `table()` output is the section's most honest number: how many ASVs were called by nobody, by exactly one method, and by two, three, or all four.
+
+```{r da-votes}
+votes <- data.frame(DESeq2    = taxa_names(ps.da) %in% sig.deseq,
+                    ALDEx2    = taxa_names(ps.da) %in% sig.aldex,
+                    ANCOM_BC2 = taxa_names(ps.da) %in% sig.bc,
+                    MaAsLin3  = taxa_names(ps.da) %in% sig.m3,
+                    row.names = taxa_names(ps.da))
+votes$n_methods <- rowSums(votes)
+table(votes$n_methods)
+```
+
+The UpSet plot shows the same information set by set: each column is one combination of methods, and its height is how many ASVs exactly that combination called. Read it as a map of agreement — a tall four-method column is bedrock; tall single-method columns are each tool's private opinion.
+
+```{r da-upset, fig.width=7, fig.height=4}
+votes01 <- as.data.frame(lapply(votes[, 1:4], as.integer),
+                         row.names = rownames(votes))
+UpSetR::upset(votes01, sets = c("DESeq2", "ALDEx2", "ANCOM_BC2", "MaAsLin3"),
+              order.by = "freq",
+              mainbar.y.label = "ASVs called by exactly this combination",
+              sets.x.label = "Significant ASVs per method")
+```
+
+Finally, the consensus set — ASVs called by at least two methods — tabulated with taxonomy and the DESeq2 effect size, and plotted the way the single-method result used to be. Using the DESeq2 log2 fold change as the reported effect size, with significance decided separately, follows common 16S practice: Mancilla et al. (2021) plot differentially abundant ASVs by their DESeq2 log2FoldChange, coloured by phylum, and Ho et al. (2021), in a mouse gut study, report DESeq2 results as log2 fold changes for the taxa with the largest changes, cross-checked against ANCOM:
+
+```{r da-consensus}
+keep <- rownames(votes)[votes$n_methods >= 2]
+consensus <- cbind(
+  data.frame(ASV = keep, n_methods = votes[keep, "n_methods"],
+             DESeq2_log2FC = round(deseq.res[keep, "log2FoldChange"], 2),
+             row.names = NULL),
+  as(tax_table(ps.da)[keep, ], "matrix")[, c("Phylum", "Family", "Genus")])
+consensus <- consensus[order(-consensus$n_methods, -abs(consensus$DESeq2_log2FC)), ]
+head(consensus, 20)
+
+ggplot(consensus, aes(x = reorder(ASV, DESeq2_log2FC), y = DESeq2_log2FC,
+                      fill = Phylum)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "ASV", y = "log2 fold change (Late vs Early, DESeq2)",
+       title = "Consensus taxa: significant in at least 2 of 4 methods")
+```
+
+Read the result in tiers. Four votes is as close to ground truth as DA gets on real data; two or three votes are well supported. A single-method call is one model's opinion — not necessarily wrong (methods differ in power, and ALDEx2 trades power for a low false-positive rate), but it shouldn't headline a results section. An *empty* consensus is also a finding: report the per-method tables and say the signal isn't robust to method choice. (The `dar` and `benchdamic` packages automate this pattern, but the vote is simple by hand — and running it by hand shows the disagreement instead of hiding it.)
+
+## Caveats: what 16S cannot tell you
+
+This pipeline is standard and validated — and 16S data still have hard limits. Keep these in mind when reading any result above.
+
+- **DNA is not life.** Sequencing counts DNA, and DNA from dead cells sequences the same as DNA from living ones. A taxon in the table may be alive, dormant, or long dead — and its abundance says nothing about whether it is active. (Activity needs RNA, metabolites, or culture.)
+- **No function.** A 16S name says who is there, not what they are doing. Strains with near-identical 16S genes can carry very different genes and behave differently.
+- **Benchtop bias.** Extraction kit, cell lysis, primer choice, and PCR all distort proportions before analysis begins. Brooks et al. (2015) measured this directly in mock communities: extraction and PCR bias were far larger than sequencing or classification error, and distorted some taxa by tens of percent.
+- **Relative, not absolute.** Read counts are shares of a fixed total. A taxon can double its share while its cell count falls. Absolute abundance needs qPCR or spike-in standards.
+- **Copy number.** Bacteria carry 1 to 15+ copies of the 16S gene per genome, so read counts are not cell counts.
+- **Limited resolution.** A short region like V4 usually resolves genus, not species or strain — and cannot separate a pathogen from a harmless close relative.
+- **Contamination.** DNA from kits and reagents ("kitome") is always present. In low-biomass samples it can swamp the real signal; blanks are essential.
+- **Method sensitivity.** Filtering choices and statistical models change the answers — Nearing et al. (2022) is the demonstration. That is why differential abundance here is a four-method vote, not a single tool's output.
+
+## Reproducibility
+
+`sessionInfo()` prints the exact R version and package versions used to produce this document. Recording it matters because results — especially model fits and default parameters — can shift subtly between package versions; anyone re-running the walkthrough can compare their environment against this record.
+
+```{r session}
+sessionInfo()
+```
+
+## Summary
+
+The pipeline runs end to end — raw reads to ecological analysis — with QC checkpoints at each stage where errors can enter silently: quality profiles driving the filter parameters, a read-tracking table through denoising and chimera removal, two-layer mock-community validation (exact sequence recovery, then a chkMocks composition check on the recovered proportions), and a consensus differential-abundance analysis in which four methods built on different assumptions vote on every taxon. The Snakemake version under `workflow/` runs the identical steps as modular scripts, so the analysis can be rerun on new data by changing the config.
+
+## References
+
+- Love, M.I., Huber, W. & Anders, S. Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. *Genome Biology* 15, 550 (2014). doi:10.1186/s13059-014-0550-8
+- Fernandes, A.D. et al. Unifying the analysis of high-throughput sequencing datasets: characterizing RNA-seq, 16S rRNA gene sequencing and selective growth experiments by compositional data analysis. *Microbiome* 2, 15 (2014). doi:10.1186/2049-2618-2-15
+- Lin, H. & Peddada, S.D. Analysis of compositions of microbiomes with bias correction. *Nature Communications* 11, 3514 (2020). doi:10.1038/s41467-020-17041-7 (ANCOM-BC; this walkthrough uses its successor, ANCOM-BC2)
+- Nearing, J.T. et al. Microbiome differential abundance methods produce different results across 38 datasets. *Nature Communications* 13, 342 (2022). doi:10.1038/s41467-022-28034-z
+- Nickols, W.A. et al. MaAsLin 3: refining and extending generalized multivariable linear models for meta-omic association discovery. *Nature Methods* 23, 554–564 (2026). doi:10.1038/s41592-025-02923-9
+- Callahan, B.J. et al. DADA2: high-resolution sample inference from Illumina amplicon data. *Nature Methods* 13, 581–583 (2016). doi:10.1038/nmeth.3869
+- McMurdie, P.J. & Holmes, S. phyloseq: an R package for reproducible interactive analysis and graphics of microbiome census data. *PLoS ONE* 8, e61217 (2013). doi:10.1371/journal.pone.0061217
+- McMurdie, P.J. & Holmes, S. Waste not, want not: why rarefying microbiome data is inadmissible. *PLoS Computational Biology* 10, e1003531 (2014). doi:10.1371/journal.pcbi.1003531
+- Brooks, J.P. et al. The truth about metagenomics: quantifying and counteracting bias in 16S rRNA studies. *BMC Microbiology* 15, 66 (2015). doi:10.1186/s12866-015-0351-6
+- Foster, Z.S.L., Sharpton, T.J. & Grünwald, N.J. Metacoder: an R package for visualization and manipulation of community taxonomic diversity data. *PLoS Computational Biology* 13, e1005404 (2017). doi:10.1371/journal.pcbi.1005404
+- Mancilla, V.J., Mann, A.E., Zhang, Y. & Allen, M.S. The adult phenylketonuria (PKU) gut microbiome. *Microorganisms* 9, 530 (2021). doi:10.3390/microorganisms9030530
+- Ho, B. et al. Gut metabolites are more predictive of disease and cohoused states than gut bacterial features in a polycystic ovary syndrome-like mouse model. *mSystems* 6, e01149-20 (2021). doi:10.1128/mSystems.01149-20
