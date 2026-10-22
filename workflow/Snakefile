@@ -1,0 +1,114 @@
+configfile: "workflow/config/config.yaml"
+
+
+rule all:
+    input:
+        "results/phyloseq/ps.rds",
+        "results/figures/alpha_diversity.png",
+        "results/figures/ordination.png",
+        "results/figures/composition.png",
+        "results/figures/heat_tree.png",
+        "results/tables/filter_stats.tsv",
+        "results/tables/read_tracking.tsv",
+        "results/tables/da_votes.tsv",
+        "results/tables/da_consensus.tsv",
+        "results/figures/da_upset.png",
+        "results/tables/mock_check.tsv",
+
+
+rule download_data:
+    output:
+        fastq_dir=directory("data/MiSeq_SOP"),
+    params:
+        url=config["data_url"],
+    conda:
+        "envs/r-env.yaml"
+    script:
+        "scripts/01_download.R"
+
+
+rule filter_trim:
+    input:
+        fastq_dir="data/MiSeq_SOP",
+    output:
+        filt_fs=directory("results/filtered/forward"),
+        filt_rs=directory("results/filtered/reverse"),
+        stats="results/tables/filter_stats.tsv",
+    params:
+        trunc_len=config["trunc_len"],
+        max_ee=config["max_ee"],
+    conda:
+        "envs/r-env.yaml"
+    script:
+        "scripts/02_qc_filter.R"
+
+
+rule dada2_denoise:
+    input:
+        filt_fs="results/filtered/forward",
+        filt_rs="results/filtered/reverse",
+    output:
+        seqtab="results/tables/seqtab_nochim.rds",
+        track="results/tables/read_tracking.tsv",
+    conda:
+        "envs/r-env.yaml"
+    script:
+        "scripts/03_dada2.R"
+
+
+rule taxonomy:
+    input:
+        seqtab="results/tables/seqtab_nochim.rds",
+    output:
+        taxa="results/tables/taxa.rds",
+    params:
+        silva_url=config["silva_url"],
+    conda:
+        "envs/r-env.yaml"
+    script:
+        "scripts/04_taxonomy.R"
+
+
+rule phyloseq_analysis:
+    input:
+        seqtab="results/tables/seqtab_nochim.rds",
+        taxa="results/tables/taxa.rds",
+    output:
+        ps="results/phyloseq/ps.rds",
+        alpha="results/figures/alpha_diversity.png",
+        ordination="results/figures/ordination.png",
+        composition="results/figures/composition.png",
+        heat_tree="results/figures/heat_tree.png",
+    conda:
+        "envs/r-env.yaml"
+    script:
+        "scripts/05_phyloseq.R"
+
+
+rule differential_abundance:
+    input:
+        ps="results/phyloseq/ps.rds",
+    output:
+        votes="results/tables/da_votes.tsv",
+        consensus="results/tables/da_consensus.tsv",
+        upset="results/figures/da_upset.png",
+    params:
+        maaslin_dir="results/maaslin3",
+    conda:
+        "envs/r-env.yaml"
+    script:
+        "scripts/07_differential_abundance.R"
+
+
+rule mock_check:
+    input:
+        seqtab="results/tables/seqtab_nochim.rds",
+        fastq_dir="data/MiSeq_SOP",
+    output:
+        mock="results/tables/mock_check.tsv",
+    params:
+        mock_ref="../data/MiSeq_SOP/HMP_MOCK.v35.fasta",
+    conda:
+        "envs/r-env.yaml"
+    script:
+        "scripts/06_mock_check.R"
