@@ -1,0 +1,26 @@
+name: dada2-phyloseq
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base=4.4
+  - bioconductor-dada2
+  - bioconductor-phyloseq
+  - bioconductor-biostrings
+  - bioconductor-deseq2
+  - bioconductor-aldex2
+  - bioconductor-ancombc
+  - bioconductor-decipher
+  - bioconductor-microbiome
+  - r-ggplot2
+  - r-remotes
+  - r-corrr
+  - r-patchwork
+  - r-upsetr
+  - r-metacoder
+  # chkMocks itself is GitHub-only (microsud/chkMocks); install once with
+  # remotes::install_github("microsud/chkMocks") — needed only by
+  # scripts/06_mock_check.R
+  # maaslin3 (scripts/07_differential_abundance.R) is on Bioconductor >= 3.20;
+  # on older Bioconductor install once with
+  # remotes::install_github("biobakery/maaslin3")
