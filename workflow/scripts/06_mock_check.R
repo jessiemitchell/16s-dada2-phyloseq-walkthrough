@@ -1,6 +1,7 @@
 # Mock-community composition check with chkMocks (custom-mock route):
 # are the observed strain proportions quantitatively accurate, or just present?
 # Mirrors the walkthrough's chkMocks section. Outputs results/tables/mock_check.tsv.
+library(dada2)
 library(Biostrings)
 library(phyloseq)
 library(chkMocks)
